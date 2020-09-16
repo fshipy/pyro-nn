@@ -206,6 +206,7 @@ class Agent():
         return latentSample
 
     def update_belief(self, state):
+        # can use cache strategy to speed up running time
         observations = self.observe(state) # observations at state
         if observations: 
             num_samples = 20
