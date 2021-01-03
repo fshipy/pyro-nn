@@ -48,7 +48,7 @@ class Policy(nn.Module):
             nn.Linear(24, 24),
             nn.ReLU(),
             nn.Linear(24, 3),
-            nn.Sigmoid())
+            nn.Softmax())
 
     def forward(self, observation):
         prob = self.neural_net(observation)
