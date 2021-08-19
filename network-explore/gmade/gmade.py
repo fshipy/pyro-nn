@@ -44,6 +44,7 @@ class GMADE(nn.Module):
         var_dim_dict,
         dist_type_dict={},
         to_event_dict={},
+        mask_dict={},
         hidden_sizes=4,
         hidden_layers=1,
         verbose=True,
@@ -70,6 +71,11 @@ class GMADE(nn.Module):
                                 TODO: we can use enumeration instead of str
         to_event_dict (dict) : a dictionary <str, int> used if tensor has declared dependency 
                                 if declared, distribution.to_event(n) will be specified when sampling
+        mask_dict (dict) : a dictionary <str, str> or <str, <str1, str2, ..., fn> > used if a random variable needs to be turn off
+                                (i.e. set the log probability to zero), the first <str> should be the
+                                the random variable name that should be turned off, the second <str>
+                                should be the masked value (assume is a bernoulli)
+                                if fn is specified, it should represent a function that masked value is fn(RAN_VAR(str1), RAND_VAR(str2), ...)
         hidden_sizes (int/list(int)/list(list(int))) : there are two ways to set hidden layers:
                                 1. specify a multiplier and use the product with the total number of
                                 sets in the level as the dimension of the hidden layer (recommended)
@@ -121,6 +127,7 @@ class GMADE(nn.Module):
 
         self.input_dim_dict = input_dim_dict
         self.var_dim_dict = var_dim_dict
+        self.mask_dict = mask_dict
         self.all_var_dim_dict = var_dim_dict.copy()
         self.all_var_dim_dict.update(input_dim_dict)
         self.out_levels = self._construct_output_levels(dependency_dict)
@@ -181,7 +188,7 @@ class GMADE(nn.Module):
             print("input_levels", self.input_levels)
             print("out_levels", self.out_levels)
 
-    def forward(self, inDict, suffix=None, varNameMap=None):
+    def forward(self, inDict, suffix=None, varNameMap=None, infer_dict={}):
         """
         Variables:
 
@@ -253,7 +260,7 @@ class GMADE(nn.Module):
                     start += out_var_d
                 elif self.dist_type_dict[out_var] == "bern":
                     out_var_type = "bern"
-                    o.append(torch.narrow(x_out, -1, start, out_var_d))
+                    o.append(torch.sigmoid(torch.narrow(x_out, -1, start, out_var_d)))
                     start += out_var_d
                 elif isinstance(self.dist_type_dict[out_var], tuple) and self.dist_type_dict[out_var][0] == "cate":
                     out_var_type = "cate"
@@ -261,21 +268,43 @@ class GMADE(nn.Module):
                     cat_out = torch.narrow(x_out, -1, start, out_var_d * num_class)
                     start += out_var_d * num_class
                     if cat_out.dim() > 1: # has batch
-                        cat_out = cat_out.view(-1, out_var_d, num_class)
+                        if out_var_d > 1:
+                            cat_out = cat_out.view(-1, out_var_d, num_class)
+                        else:
+                            cat_out = cat_out.view(-1, num_class)
                     else:
                         cat_out = cat_out.view(out_var_d, num_class)
                     # FIXME do we need to apply softmax / logsoftmax ? 
+                    cat_out = F.log_softmax(cat_out, dim=1)
                     o.append(cat_out)
 
                 if suffix is not None:
                     varName = out_var + str(suffix)
                 else:
                     varName = varNameMap[out_var]
-                sampled_var = self._sample_var(varName, o, type=out_var_type, toEvent=toEvent)
+                mask = torch.tensor(1.0)
+                if out_var in self.mask_dict:
+                    if isinstance(self.mask_dict[out_var], str):
+                        mask = ret_var_names_Dict[self.mask_dict[out_var]]
+                    elif isinstance(self.mask_dict[out_var], list):
+                        masked_fn = self.mask_dict[out_var][-1]
+                        masked_fn_args = []
+                        for arg_name in self.mask_dict[out_var][:-1]:
+                            if arg_name in inDict:
+                                masked_fn_args.append(inDict[arg_name])
+                            elif arg_name in ret_var_names_Dict:
+                                masked_fn_args.append(ret_var_names_Dict[arg_name])
+                            else:
+                                raise ValueError("masking arg_name:" + arg_name + " is not found")
+                        mask = masked_fn(*masked_fn_args)
+                        #print("masked_fn_args", masked_fn_args)
+                infer = infer_dict[out_var] if out_var in infer_dict else dict()
+                
+                sampled_var = self._sample_var(varName, o, mask, type=out_var_type, toEvent=toEvent, infer = infer)
                 ret_var_names_Dict[out_var] = sampled_var
                 # TODO input last output layer as next input or sampled value
                 # i.e. if normal, should next input be [loc, scale] or value sampled from dist 
-
+        
         return ret_var_names_Dict
     
     def train(self, mode=True):
@@ -286,23 +315,27 @@ class GMADE(nn.Module):
         super().eval()
         self.usePyroSample = False
 
-    def _sample_var(self, name, o, type="norm", toEvent=None):
+    def _sample_var(self, name, o, mask, type="norm", toEvent=None, infer=dict()):
         # TODO support more distribution types
         # TODO handle repeated random variable name
-        if type == "norm":
-            if not self.usePyroSample: 
-                print("haha")
-                return dist.Normal(o[0], o[1]).sample()
-            if toEvent: return pyro.sample(name, dist.Normal(o[0], o[1]).to_event(toEvent))
-            else: return pyro.sample(name, dist.Normal(o[0], o[1]))
-        elif type == "bern":
-            if not self.usePyroSample: return dist.Bernoulli(o[0]).sample()
-            if toEvent: return pyro.sample(name, dist.Bernoulli(o[0]).to_event(toEvent))
-            else: return pyro.sample(name, dist.Bernoulli(o[0]))
-        elif type == "cate":
-            if not self.usePyroSample: return dist.Categorical(o[0]).sample()
-            if toEvent: return pyro.sample(name, dist.Categorical(o[0]).to_event(toEvent))
-            else: return pyro.sample(name, dist.Categorical(o[0]))
+        try:
+            if type == "norm":
+                if not self.usePyroSample: 
+                    return dist.Normal(o[0], o[1]).sample()
+                if toEvent: return pyro.sample(name, dist.Normal(o[0], o[1]).mask(mask).to_event(toEvent), infer=infer)
+                else: return pyro.sample(name, dist.Normal(o[0], o[1]).mask(mask), infer=infer)
+            elif type == "bern":
+                if not self.usePyroSample: return dist.Bernoulli(o[0]).sample()
+                if toEvent: return pyro.sample(name, dist.Bernoulli(o[0]).mask(mask).to_event(toEvent), infer=infer)
+                else: return pyro.sample(name, dist.Bernoulli(o[0]).mask(mask), infer=infer)
+            elif type == "cate":
+                if not self.usePyroSample: return dist.Categorical(o[0]).sample()
+                if toEvent: return pyro.sample(name, dist.Categorical(o[0]).mask(mask).to_event(toEvent), infer=infer)
+                else: return pyro.sample(name, dist.Categorical(o[0]).mask(mask), infer=infer)
+        except Exception as e:
+            print(e)
+            print(name, o, mask, type, toEvent)
+            raise
 
     def _construct_output_levels(self, dependency_dict):
         """
@@ -332,7 +365,15 @@ class GMADE(nn.Module):
             while unassigned:
                 rand_var = unassigned.pop()
                 assign = True
-                for dep in dependency_dict[rand_var]:
+                all_dependencies = list(dependency_dict[rand_var])
+                if rand_var in self.mask_dict:
+                    if isinstance(self.mask_dict[rand_var], str):
+                        all_dependencies.append(self.mask_dict[rand_var])
+                    elif isinstance(self.mask_dict[rand_var], list):
+                        all_dependencies += (self.mask_dict[rand_var][:-1])
+                    all_dependencies = set(all_dependencies)
+                print("all_dependencies", rand_var, all_dependencies)
+                for dep in all_dependencies:#dependency_dict[rand_var]:
                     if not (dep in self.input_dim_dict or dep in assigned):
                         assign = False
                         break
@@ -343,6 +384,7 @@ class GMADE(nn.Module):
                     temp_unassigned.add(rand_var)
             if not cur_level:
                 print("Warning: cur_level is empty")
+            #cur_level.sort()
             output_levels.append(cur_level)
             unassigned = temp_unassigned
             assigned = assigned.union(temp_assigned)
@@ -367,9 +409,10 @@ class GMADE(nn.Module):
         ]
 
         """
-        input_levels = [list(self.input_dim_dict.keys())]
+        #input_levels = [list(self.input_dim_dict.keys())]
+        input_levels = []
         cur_all_inputs = set(self.input_dim_dict.keys())
-        for i in range(1, len(self.out_levels)):
+        for i in range(0, len(self.out_levels)):
             cur_all_inputs = cur_all_inputs.union(set(self.out_levels[i - 1]))
             cur_level_inputs = set()
             for rand_var in cur_all_inputs:
@@ -387,7 +430,9 @@ class GMADE(nn.Module):
         """
         construct the sets and orderings for input and output of a level
         """
-        indices = range(len(input_level))
+
+        """ old version
+        indices = range(len(input_level)) # 0, 1, 2, 3
         all_sets = []
         for n in range(1, len(indices) + 1):
             all_sets += list(itertools.combinations(indices, n))
@@ -402,6 +447,34 @@ class GMADE(nn.Module):
             temp = tuple(ord)
             out_orderings.append(all_sets.index(temp))
         return all_sets, input_ordering, out_orderings
+        """
+
+        indices = range(len(input_level)) # 0, 1, 2, 3
+        out_sets = []
+        all_sets = []
+        for out_rand_var in out_level:
+            ord = []
+            for dep in dependency_dict[out_rand_var]:
+                ord.append(input_level.index(dep))
+            ord.sort()
+            temp = tuple(ord)
+            out_sets.append(temp)
+            for n in range(1, len(temp) + 1):
+                all_sets += list(itertools.combinations(ord, n))
+        all_sets = list(set(all_sets))
+        all_sets.sort()
+        out_orderings = []
+        for out_set in out_sets:
+            out_orderings.append(all_sets.index(out_set))
+        input_ordering = []
+        for input_idx in indices:
+            input_ordering.append(all_sets.index((input_idx,)))
+        print("all_sets", all_sets)
+        print("input_ordering", input_ordering)
+        print("out_sets", out_sets)
+        print("out_orderings", out_orderings)
+        return all_sets, input_ordering, out_orderings
+
 
     def _build_level(
         self,
@@ -427,8 +500,15 @@ class GMADE(nn.Module):
         all_sets, input_ordering, out_ordering = self._construct_level_ordering(
             input_level, out_level, dependency_dict
         )
+
+        expanded_input_ordering = []
+        for in_order, in_rand_var in zip(input_ordering, input_level):
+            d = self.all_var_dim_dict[in_rand_var]
+            expanded_input_ordering += [in_order] * d
+
         if hid_sizes == "auto":
-            hid_sizes = [(len(all_sets) + 1) * hid_mul] * hid_layers
+            hid_s = max((len(all_sets) + 1) * hid_mul, len(expanded_input_ordering) * hid_mul)
+            hid_sizes = [hid_s] * hid_layers
 
         is_subset_np = np.frompyfunc(is_subset, 2, 1)
         hid_orderings = [
@@ -437,10 +517,6 @@ class GMADE(nn.Module):
         ]
         level_nn = []
         assert len(hid_sizes) > 0
-        expanded_input_ordering = []
-        for in_order, in_rand_var in zip(input_ordering, input_level):
-            d = self.all_var_dim_dict[in_rand_var]
-            expanded_input_ordering += [in_order] * d
         # input layer
         level_nn.append(MaskedLinear(len(expanded_input_ordering), hid_sizes[0]))
         level_nn.append(nn.ReLU())
@@ -499,18 +575,14 @@ class GMADE(nn.Module):
         level_nn = nn.Sequential(*level_nn)
 
         if self.verbose:
-            print("hid_orderings", hid_orderings[0], "size", len(hid_orderings[0]))
+            print("hid_orderings size", len(hid_orderings[0]))
             print("num hid layers:", len(hid_orderings))
             print(
-                "expanded_input_ordering",
-                expanded_input_ordering,
-                "size",
+                "expanded_input_ordering size",
                 len(expanded_input_ordering),
             )
             print(
-                "expanded_output_ordering",
-                expanded_output_ordering,
-                "size",
+                "expanded_output_ordering size",
                 len(expanded_output_ordering),
             )
         return level_nn, len(expanded_input_ordering), len(expanded_output_ordering)
