@@ -188,7 +188,7 @@ class GMADE(nn.Module):
             print("input_levels", self.input_levels)
             print("out_levels", self.out_levels)
 
-    def forward(self, inDict, suffix=None, varNameMap=None, infer_dict={}):
+    def forward(self, inDict, suffix=None, varNameMap=None, infer_dict={}, mask_dict={}):
         """
         Variables:
 
@@ -197,6 +197,7 @@ class GMADE(nn.Module):
                        if not used in iterative or recursive functions, can set it to "" (default when None)
         varNameMap (dict) : a substitute for suffix, used when the user want to specify the full name for
                             random variable name used in pyro.sample statement (not frequently used)
+        mask_dict (dict) : <str, bool/tensor(bool)> specified if using operations that are not operated on random variables in the current basic blocks 
 
         Return:
         ret_var_names_Dict (dict) : a dictionary <str, tensor> specified the output for each random variable 
@@ -298,6 +299,9 @@ class GMADE(nn.Module):
                                 raise ValueError("masking arg_name:" + arg_name + " is not found")
                         mask = masked_fn(*masked_fn_args)
                         #print("masked_fn_args", masked_fn_args)
+                elif out_var in mask_dict:
+                    mask = mask_dict[out_var]
+                
                 infer = infer_dict[out_var] if out_var in infer_dict else dict()
                 
                 sampled_var = self._sample_var(varName, o, mask, type=out_var_type, toEvent=toEvent, infer = infer)
